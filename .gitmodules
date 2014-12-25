@@ -1,0 +1,3 @@
+[submodule "sasazka"]
+	path = sasazka
+	url = https://github.com/summerwind/sasazka
