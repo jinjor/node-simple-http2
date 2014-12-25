@@ -21,10 +21,6 @@ server.on('secureConnection', function(socket) {
   socket.on('close', function(isException) {
     console.log('closed');
   });
-  socket.on('finish', function(e) {
-    console.log('finish');
-  });
-
   if (socket.npnProtocol === 'h2-14' || socket.npnProtocol === 'h2-16') {
     start(socket);
   } else {
