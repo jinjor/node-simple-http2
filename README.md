@@ -1,7 +1,11 @@
 node-simple-http2
 =================
 
-Simple implementation of http2 server by Node.js
+Simple implementation of HTTP/2 server by Node.js
+
+- only sending 'Hello, World!'
+- working with some browsers
+- readable for beginner (no streams & no objects)
 
 ### Clone
 ```
@@ -22,3 +26,5 @@ PEM pass is `http2`.
 2. visit `about:config`
 3. set `network.http.spdy.enforce-tls-profile` to `false`
 4. visit `https://localhost:8443`
+5. setting this server as trusted one
+
