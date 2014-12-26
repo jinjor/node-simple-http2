@@ -276,8 +276,8 @@ function sendResponseHello(socket, streamId) {
   socket.write(buffer);
 }
 
-
-function sendResponseHTML(socket, streamId, requestHeaders) {
+var encoder = hpack.createContext();
+function sendResponseHTML(socket, streamId, requestHeaders, noHTML) {
 
   var path = requestHeaders.headerBlockFragment[1][1]; // maybe value of :path
   if (path === '/') {
@@ -287,11 +287,14 @@ function sendResponseHTML(socket, streamId, requestHeaders) {
   }
 
   // HEADER -------------//
-  var encoder = hpack.createContext();
-  var headers = [
-    [':status', '200'],
-    [':content-type', 'text/html']
-  ];
+  var headers = [];
+  headers[0] = [':status', '200'];
+  if (!noHTML) {
+    headers[1] = ['content-type', 'text/html'];
+  } else {
+    headers[1] = [':path', '/app.css'];
+    headers[2] = ['content-type', 'text/css'];
+  }
   var compressed = encoder.compress(headers);
 
   var payloadLength = compressed.length;
@@ -329,37 +332,41 @@ function sendResponseHTMLWithPush(socket, streamId, requestHeaders) {
   } else {
     path = path.substring(1);
   }
+  console.log(path);
 
   if (path === 'index.html') {
-    // HEADER -------------//
+    // PUSH_PROMISE -------------//
 
-    var encoder = hpack.createContext();
-    var headers = [
-      [':status', '200'],
-      [':path', '/app.css']
-    ];
+    
+    var headers = [];
+    requestHeaders.headerBlockFragment.forEach(function(header){
+      if(header[0] === ':path'){
+        headers.push([':path', '/app.css']);
+      } else {
+        headers.push(header);
+      }
+    });
+
     var compressedResponseHeader = encoder.compress(headers);
 
     var payloadLength = compressedResponseHeader.length + 4;
     var type = 0x05; // PUSH_PROMISE
     var buffer = new Buffer(9 + payloadLength);
     var flags = 0x4; // end_headers
-    // header
     writeHeader(buffer, payloadLength, type, flags, streamId);
-    var promisedStreamId = 2;
+    var promisedStreamId = 4;
     buffer.writeUInt32BE(promisedStreamId, 9);
     compressedResponseHeader.copy(buffer, 9 + 4);
     socket.write(buffer);
 
     sendResponseHTML(socket, promisedStreamId, {
       headerBlockFragment: [
-        null,
-        [null, '/app.css']
+        null, [null, '/app.css']
       ]
-    });
+    }, true);
     sendResponseHTML(socket, streamId, requestHeaders);
   } else {
-    assert.fail();
+    assert.fail('aa');
   }
 
 }
