@@ -24,7 +24,7 @@ server.on('secureConnection', function(socket) {
   if (socket.npnProtocol === 'h2-14' || socket.npnProtocol === 'h2-16') {
     start(socket);
   } else {
-    assert.fail();
+    assert.fail('socket.npnProtocol:' + socket.npnProtocol);
   }
 });
 server.listen(8443);
@@ -366,7 +366,7 @@ function sendResponseHTMLWithPush(socket, streamId, requestHeaders) {
     }, true);
     sendResponseHTML(socket, streamId, requestHeaders);
   } else {
-    assert.fail('aa');
+    assert.fail();
   }
 
 }
