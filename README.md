@@ -24,6 +24,7 @@ PEM pass is `http2`.
 
 1. open [Firefox Nightly](https://nightly.mozilla.org/)
 2. visit `about:config`
+3. set `network.http.spdy.enabled.http2draft` to `true`
 3. set `network.http.spdy.enforce-tls-profile` to `false`
 4. visit `https://localhost:8443`
 5. setting this server as trusted one
