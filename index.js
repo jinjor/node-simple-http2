@@ -1,8 +1,9 @@
 var fs = require('fs');
-var https = require('https');
+var tls = require('tls');
 var assert = require('assert');
 var hpack = require('./sasazka/lib/hpack.js');
 
+var SETTINGS_MAX_FRAME_SIZE = 16384;
 var CLIENT_PRELUDE = new Buffer('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n');
 
 var options = {
@@ -13,13 +14,13 @@ var options = {
   NPNProtocols: ['h2-14', 'h2-16', 'http/1.1', 'http/1.0'], //unofficial
 };
 
-var server = https.createServer(options);
-var originalSocketListeners = server.listeners('secureConnection');
-server.removeAllListeners('secureConnection');
-
+var server = tls.createServer(options)
 server.on('secureConnection', function(socket) {
   socket.on('close', function(isException) {
     console.log('closed');
+  });
+  socket.on('error', function(err) {
+    console.log(err.stack);
   });
   if (socket.npnProtocol === 'h2-14' || socket.npnProtocol === 'h2-16') {
     start(socket);
@@ -30,36 +31,30 @@ server.on('secureConnection', function(socket) {
 server.listen(8443);
 
 function start(socket) {
+  var context = {
+    compressor: hpack.createContext(),
+    decompressor: hpack.createContext(),
+    streams: [true]
+  };
   socket.once('readable', function() {
     var buf = socket.read();
+    if(!buf) {
+      console.log('buf is null');
+      return;
+    }
     for (var i = 0; i < CLIENT_PRELUDE.length; i++) {
       if (buf[i] !== CLIENT_PRELUDE[i]) {
         console.log(buf.toString());
-        socket.error('handshake', 'PROTOCOL_ERROR');
+        socket.end();//TODO send GOAWAY 0x1かも（3.5）
         return;
       }
     }
     console.log('Successfully received the client connection header prelude.');
-
-    if (buf.length > CLIENT_PRELUDE.length) {
-      var buf = buf.slice(CLIENT_PRELUDE.length);
-
-      while (buf.length > 0) {
-        var length = buf.readUInt32BE(0) >> 8;
-        var type = buf.readUInt8(3);
-        var flags = buf.readUInt8(4);
-        var streamId = buf.readUInt32BE(5);
-        var body = buf.slice(9, 9 + length);
-        processFrame(socket, type, flags, streamId, body);
-        buf = buf.slice(9 + length);
-      }
-    }
-    mainLoop(socket);
-
+    mainLoop(socket, context, buf.slice(CLIENT_PRELUDE.length));
   });
 }
 
-function mainLoop(socket) {
+function mainLoop(socket, context, buf) {
   //   0                   1                   2                   3
   //   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
   //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -71,74 +66,268 @@ function mainLoop(socket) {
   //  +=+=============================================================+
   //  |                   Frame Payload (0...)                      ...
   //  +---------------------------------------------------------------+
-  var offset = 0;
-  var buffer = null;
+  var prev = new Buffer(0);
+
+  var read = function(buf) {
+
+    buf = Buffer.concat([prev, buf]);
+    while (buf.length > 0) {
+      var length = buf.readUInt32BE(0) >> 8;
+      var type = buf.readUInt8(3);
+      var flags = buf.readUInt8(4);
+      var streamId = buf.readUInt32BE(5);
+      if(buf.length >= 9 + length) {
+        var body = buf.slice(9, 9 + length);
+        processFrame(socket, context, type, flags, streamId, body);
+        buf = buf.slice(9 + length);
+      } else {
+        break;
+      }
+    }
+    prev = buf;
+  }
+  read(buf);
 
   socket.on('readable', function() { // assume synchronized & sequencial
     var buf = socket.read();
-    if (buffer === null) {
-      var frameLength = 9 + (buf.readUInt32BE(0) >> 8); // header + payload
-      buffer = new Buffer(frameLength);
+    if(!buf) {
+      return;
+      // throw 'buff is null';
     }
-    buf.copy(buffer, offset);
-    offset += buf.length;
-    if (offset >= buffer.length) {
-      // console.log(offset, buffer.length);
-      var length = buf.readUInt32BE(0) >> 8;
-      var type = buffer.readUInt8(3);
-      var flags = buffer.readUInt8(4);
-      var streamId = buffer.readUInt32BE(5);
-      var payload = buffer.slice(9, 9 + length);
-      // console.log(payload.length + 9, buffer.length);
-      processFrame(socket, type, flags, streamId, payload);
-
-      // reset
-      // TODO
-      offset = 0;
-      buffer = null;
-    }
+    read(buf);
   });
 
 }
 
-function processFrame(socket, type, flags, streamId, payload) {
-  console.log();
+function processFrame(socket, context, type, flags, streamId, payload) {
+  // console.log();
   console.log('[' + streamId + ']');
+  //3.5
+  if(payload.length > 16384) {
+    sendGoAway(socket, streamId, 0x6);
+    return;
+  }
+  //5.1.1
+  if(streamId >= 2 && streamId % 2 === 0 && context.streams[streamId] === undefined) {
+    sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+    return;
+  }
+  //5.1.1
+  if(streamId < context.streams.length - 1 && context.streams[streamId] === undefined) {
+    sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+    return;
+  }
+
+  //6.2
+  if(context.continuationStreamId) {
+    if(type !== 0x09) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+    if(context.continuationStreamId !== streamId) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+    context.continuationStreamId = null;
+  }
+
+
+  
+  context.streams[streamId] = context.streams[streamId] || 1;//idle?
+
+
+  var count = 0;
+  for(var i = 0; i < context.streams.length; i++) {
+    if(context.streams[i]) {
+      count++;
+    }
+  }
+  if(context.settings && count > context.settings.maxConcurrentStreams) {
+    // console.log(count, context.settings.maxConcurrentStreams)
+    sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+    return;
+  }
+
+
+
+
   if (type === 0x00) {
     console.log('DATA - not supported');
+    if(streamId === 0) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+    if(context.streams[streamId] !== 2) {
+      sendGoAway(socket, streamId, 0x5);//STREAM_CLOSED
+      return;
+    }
   } else if (type === 0x01) {
     console.log('HEADERS');
-    var headers = readHeaders(flags, payload);
+    if(streamId === 0) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+    var headers = readHeaders(context, flags, payload);
+
+    //8.1.2
+    var containsUpperCase = false;
+    var keys = Object.keys(headers.data);
+    for(var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      if(key.toLowerCase() !== key) {
+        containsUpperCase = true;
+        break;
+      }
+    }
+    if(containsUpperCase) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+
+    //8.1.2.1
+    var containsInvalidPseudoFields = false;
+    var keys = Object.keys(headers.data);
+    for(var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      if(key[0] === ':') {
+        if(key !== ':method' && key !== ':scheme' && key !== ':authority' && key !== ':path') {
+          containsInvalidPseudoFields = true;
+          break;
+        }
+      }
+    }
+    if(containsInvalidPseudoFields) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+
+    //8.1.2.1
+    var invalidFieldOrder = false;
+    for(var i = 0; i < headers.headerBlockFragment.length; i++) {
+      var pair = headers.headerBlockFragment[i];
+      if(pair[0][0] === ':' && headers.headerBlockFragment[i - 1] && headers.headerBlockFragment[i - 1][0][0] !== ':') {
+        invalidFieldOrder = true;
+        break;
+      }
+    }
+    if(invalidFieldOrder) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+
+    //8.1.2.2
+    if(headers.data.connection) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+
+    //8.1.2.2
+    if(headers.data.te && headers.data.te !== 'trailers') {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+
+    //8.1.2.3
+    if(!headers.data[':method'] || !headers.data[':scheme'] || !headers.data[':path']) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+
+    //8.1.2.6
+    if(headers.data['content-length'] && +headers.data['content-length'] !== payload.length) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+    
+    if(headers.endHeaders) {
+      context.streams[streamId] = 2;//open
+    } else {
+      context.continuationStreamId = streamId;
+    }
     console.log(headers);
-    // sendResponseHello(socket, streamId);
-    // sendResponseHTML(socket, streamId, headers);
-    sendResponseHTMLWithPush(socket, streamId, headers);
+    // sendResponseHTML(socket, context, streamId, headers);
+    sendResponseHTMLWithPush(socket, context, streamId, headers);
   } else if (type === 0x02) {
     console.log('PRIORITY - not supported');
+    if(streamId === 0) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+    if(payload.length !== 5) {
+      sendGoAway(socket, streamId, 0x6);//FRAME_SIZE_ERROR
+      return;
+    }
+    readPriority(flags, payload);
   } else if (type === 0x03) {
     console.log('RST_STREAM - not supported');
+    if(streamId === 0) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+    if(context.streams[streamId] === 1) {//idle
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+    if(payload.length !== 4) {
+      sendGoAway(socket, streamId, 0x6);//FRAME_SIZE_ERROR
+      return;
+    }
   } else if (type === 0x04) {
     console.log('SETTINGS');
-    assert.equal(streamId, 0);
+    if(streamId !== 0) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
     var ack = !!(flags & 0x1);
-    if (!ack) {
+    if(ack) {
+      if(payload.length !== 0) {
+        sendGoAway(socket, streamId, 0x6);//FRAME_SIZE_ERROR
+        return;
+      }
+    } else {
+      if(payload.length % 6 !== 0) {
+        sendGoAway(socket, context.streams.length - 1, 0x6);//FRAME_SIZE_ERROR
+        return;
+      }
       var settings = readSettings(payload);
-      console.log(settings);
+      context.settings = settings;//TODO これでいいのか確認
       sendSettings(socket, settings.maxConcurrentStreams);
     }
   } else if (type === 0x05) {
-    console.log('PUSH_PROMISE - not supported');
+    console.log('PUSH_PROMISE');
+    sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+    return;
   } else if (type === 0x06) {
     console.log('PING');
+    if(streamId !== 0) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+    if(payload.length !== 8) {
+      sendGoAway(socket, streamId, 0x6);//FRAME_SIZE_ERROR
+      return;
+    }
     var ack = !!(flags & 0x1);
     if (!ack) {
       sendPing(socket, streamId, payload);
     }
   } else if (type === 0x07) {
     console.log('GOAWAY - not supported');
+    if(streamId !== 0) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
   } else if (type === 0x08) {
     console.log('WINDOW_UPDATE - not supported');
     var windowSizeIncrement = payload.readUInt32BE(0);
+    if(windowSizeIncrement === 0) {
+      sendGoAway(socket, streamId, 0x1);//PROTOCOL_ERROR
+      return;
+    }
+    if(payload.length % 4 !== 0) {
+      sendGoAway(socket, context.streams.length - 1, 0x6);//FRAME_SIZE_ERROR
+      return;
+    }
   } else if (type === 0x09) {
     console.log('CONTINUATION - not supported');
   } else {
@@ -160,7 +349,7 @@ function readSettings(payload) {
       settings.headerTableSize = value;
     } else if (identifier === 0x2) { //SETTINGS_ENABLE_PUSH
       settings.enablePush = value;
-    } else if (identifier === 0x3) { //SETTINGS_MAX_CONCURRENT_STREAMS  
+    } else if (identifier === 0x3) { //SETTINGS_MAX_CONCURRENT_STREAMS
       settings.maxConcurrentStreams = value;
     } else if (identifier === 0x4) { //SETTINGS_INITIAL_WINDOW_SIZE
       settings.initialWindowSize = value;
@@ -175,11 +364,10 @@ function readSettings(payload) {
   return settings;
 }
 
-var decompressor = hpack.createContext(); // shares context?
-function readHeaders(flags, payload) {
+function readHeaders(context, flags, payload) {
   var headers = {};
   var endStream = !!(flags & 0x1);
-  var endHeaders = !!(flags & 0x4);
+  headers.endHeaders = !!(flags & 0x4);
   var padded = !!(flags & 0x8);
   var priority = !!(flags & 0x20);
   var offset = 0;
@@ -197,9 +385,18 @@ function readHeaders(flags, payload) {
     headers.weight = weight;
   }
   var headerBlockFragment = payload.slice(offset); //assume padding does not exist
-  var decompressed = decompressor.decompress(headerBlockFragment);
+  var decompressed = context.decompressor.decompress(headerBlockFragment);
   headers.headerBlockFragment = decompressed;
+
+  headers.data = {};
+  decompressed.forEach(function(pair) {
+    headers.data[pair[0]] = pair[1];
+  });
   return headers;
+}
+
+function readPriority(flags, payload) {
+
 }
 
 
@@ -240,46 +437,9 @@ function sendSettings(socket, maxConcurrentStreams) {
   socket.write(buffer);
 }
 
+function sendResponseHTML(socket, context, streamId, requestHeaders, noHTML) {
 
-function sendResponseHello(socket, streamId) {
-
-  // HEADER -------------//
-  var encoder = hpack.createContext();
-  var headers = [
-    [':status', '200']
-  ];
-  var compressed = encoder.compress(headers);
-
-  var payloadLength = compressed.length;
-  var type = 0x01; //HEADERS
-  var header = new Buffer(9);
-
-  var flags = 0x4; // end_headers
-  // header
-  writeHeader(header, payloadLength, type, flags, streamId);
-
-  var buffer = Buffer.concat([header, compressed]);
-  socket.write(buffer);
-
-  // BODY -------------//
-  var data = new Buffer('Hello, World!');
-
-  var payloadLength = data.length;
-  var type = 0x00; // DATA
-  var header = new Buffer(9);
-
-  var flags = 0x1; // end_stream
-  // header
-  writeHeader(header, payloadLength, type, flags, streamId);
-
-  var buffer = Buffer.concat([header, data]);
-  socket.write(buffer);
-}
-
-var encoder = hpack.createContext();
-function sendResponseHTML(socket, streamId, requestHeaders, noHTML) {
-
-  var path = requestHeaders.headerBlockFragment[1][1]; // maybe value of :path
+  var path = requestHeaders.data[':path'];
   if (path === '/') {
     path = 'index.html';
   } else {
@@ -295,7 +455,7 @@ function sendResponseHTML(socket, streamId, requestHeaders, noHTML) {
     headers[1] = [':path', '/app.css'];
     headers[2] = ['content-type', 'text/css'];
   }
-  var compressed = encoder.compress(headers);
+  var compressed = context.compressor.compress(headers);
 
   var payloadLength = compressed.length;
   var type = 0x01; //HEADERS
@@ -324,9 +484,9 @@ function sendResponseHTML(socket, streamId, requestHeaders, noHTML) {
 }
 
 
-function sendResponseHTMLWithPush(socket, streamId, requestHeaders) {
+function sendResponseHTMLWithPush(socket, context, streamId, requestHeaders) {
 
-  var path = requestHeaders.headerBlockFragment[1][1]; // maybe value of :path
+  var path = requestHeaders.data[':path'];
   if (path === '/') {
     path = 'index.html';
   } else {
@@ -336,35 +496,38 @@ function sendResponseHTMLWithPush(socket, streamId, requestHeaders) {
 
   if (path === 'index.html') {
     // PUSH_PROMISE -------------//
-
-    
     var headers = [];
-    requestHeaders.headerBlockFragment.forEach(function(header){
-      if(header[0] === ':path'){
+    requestHeaders.headerBlockFragment.forEach(function(header) {
+      if (header[0] === ':path') {
         headers.push([':path', '/app.css']);
       } else {
         headers.push(header);
       }
     });
 
-    var compressedResponseHeader = encoder.compress(headers);
+    var compressedResponseHeader = context.compressor.compress(headers);
 
     var payloadLength = compressedResponseHeader.length + 4;
     var type = 0x05; // PUSH_PROMISE
     var buffer = new Buffer(9 + payloadLength);
     var flags = 0x4; // end_headers
     writeHeader(buffer, payloadLength, type, flags, streamId);
+
     var promisedStreamId = 4;
+    context.streams[promisedStreamId] = true;//TODO
+
+
     buffer.writeUInt32BE(promisedStreamId, 9);
     compressedResponseHeader.copy(buffer, 9 + 4);
     socket.write(buffer);
+    console.log('send PUSH_PROMISE');
 
-    sendResponseHTML(socket, promisedStreamId, {
-      headerBlockFragment: [
-        null, [null, '/app.css']
-      ]
+    sendResponseHTML(socket, context, promisedStreamId, {
+      data: {
+        ':path': '/app.css'
+      }
     }, true);
-    sendResponseHTML(socket, streamId, requestHeaders);
+    sendResponseHTML(socket, context, streamId, requestHeaders);
   } else {
     assert.fail();
   }
@@ -386,23 +549,20 @@ function sendPing(socket, streamId, payload) {
   socket.write(buffer);
 }
 
-function sendGoAway(socket, streamId) {
+function sendGoAway(socket, lastStreamId, errorCode) {
+  console.log('send goaway: ' + errorCode);
   var header = new Buffer(9);
   var payloadLength = 8;
   var type = 0x07; // GOAWAY
   var flags = 0x0;
 
-  var lastStreamId = streamId; // ?
-  var errorCode = 0;
-
   var buffer = new Buffer(9 + payloadLength);
 
-  writeHeader(buffer, payloadLength, type, flags, streamId);
+  writeHeader(buffer, payloadLength, type, flags, 0);
   //
   buffer.writeUInt32BE(lastStreamId, 9);
   buffer.writeUInt32BE(errorCode, 13);
-
-  socket.end(buffer);
+  socket.write(buffer);
 }
 
 function writeHeader(buffer, length, type, flags, streamId) {
