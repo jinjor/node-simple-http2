@@ -183,14 +183,13 @@ function processFrame(socket, context, type, flags, streamId, payload) {
 
 
   //6.2
-  if (context.continuationStreamId) {
+  if (context.headerFragment) {
     if (type !== _.TYPE_CONTINUATION) {
       error(_.ERROR_PROTOCOL_ERROR, 'error3');
     }
-    if (context.continuationStreamId !== streamId) {
+    if (context.headerFragment.streamId !== streamId) {
       error(_.ERROR_PROTOCOL_ERROR, 'error4');
     }
-    context.continuationStreamId = null;
   }
 
   context.streams[streamId] = context.streams[streamId] || 1; //idle?
@@ -227,7 +226,25 @@ function processHEADERS(socket, context, flags, streamId, payload) {
   if (streamId === 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
-  var headers = readHeaders(context, flags, payload);
+  // flags = context.headerFragment ? context.headerFragment.flags : flags;
+  // streamId = context.headerFragment ? context.headerFragment.streamId : streamId;
+  payload = context.headerFragment ? Buffer.concat([context.headerFragment.payload, payload]) : payload;
+  var endStream = !!(flags & 0x1);
+  var endHeaders = !!(flags & 0x4);
+  var padded = !!(flags & 0x8);
+  var priority = !!(flags & 0x20);
+  var headers = readHeaders(context, padded, priority, payload);
+
+  if (!endHeaders) {
+    context.headerFragment = {
+      flags: flags,
+      streamId: streamId,
+      payload: payload
+    };
+    return;
+  }
+  context.headerFragment = null;
+  context.streams[streamId] = 2; //open
 
   //8.1.2
   var keys = Object.keys(headers.data);
@@ -273,11 +290,7 @@ function processHEADERS(socket, context, flags, streamId, payload) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
 
-  if (headers.endHeaders) {
-    context.streams[streamId] = 2; //open
-  } else {
-    context.continuationStreamId = streamId;
-  }
+  
   console.log('  ' + headers.data[':method'] + ' ' + headers.data[':path']);
   sendResponseHTML(socket, context, streamId, headers);
 }
@@ -326,7 +339,12 @@ function processWINDOW_UPDATE(socket, context, flags, streamId, payload) {
   console.log('  ' + windowSizeIncrement);
 }
 
-function processCONTINUATION(socket, context, flags, streamId, payload) {}
+function processCONTINUATION(socket, context, flags, streamId, payload) {
+  if(!context.headerFragment) {
+    error(_.ERROR_PROTOCOL_ERROR);
+  }
+  processHEADERS(socket, context, flags, streamId, payload);
+}
 
 function processRST_STREAM(socket, context, flags, streamId, payload) {
   if (streamId === 0) {
@@ -379,12 +397,9 @@ function applySettings(context, payload) {
   }
 }
 
-function readHeaders(context, flags, payload) {
+function readHeaders(context, padded, priority, payload) {
   var headers = {};
-  var endStream = !!(flags & 0x1);
-  headers.endHeaders = !!(flags & 0x4);
-  var padded = !!(flags & 0x8);
-  var priority = !!(flags & 0x20);
+
   var offset = 0;
   offset += padded ? 1 : 0;
   offset += priority ? 5 : 0;
@@ -397,7 +412,6 @@ function readHeaders(context, flags, payload) {
   if (payload.length - offset - padLength < 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
-  // console.log(endStream, endHeaders);
   if (priority) {
     var streamDependency = payload.readUInt32BE((padded ? 1 : 0) + 0);
     var weight = payload.readUInt8((padded ? 1 : 0) + 4);
