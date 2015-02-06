@@ -1,36 +1,7 @@
-var fs = require('fs');
 var tls = require('tls');
-var assert = require('assert');
 var hpack = require('./sasazka/lib/hpack.js');
-
 var _ = require('./constants.js');
-
-var options = {
-  key: fs.readFileSync('./ssl/server.key'),
-  cert: fs.readFileSync('./ssl/server.crt'),
-  requestCert: true,
-  rejectUnauthorized: false,
-  NPNProtocols: ['h2-14', 'h2-16', 'http/1.1', 'http/1.0'], //unofficial
-};
-
-var server = tls.createServer(options)
-server.on('secureConnection', function(socket) {
-  socket.on('close', function(isException) {
-    console.log('<<end>>');
-  });
-  socket.on('error', function(err) {
-    console.log(err.stack);
-  });
-  if (socket.npnProtocol === 'h2-14' || socket.npnProtocol === 'h2-16') {
-    console.log();
-    console.log('<<start>> protocol: ' + socket.npnProtocol);
-    start(socket);
-  } else {
-    assert.fail('socket.npnProtocol:' + socket.npnProtocol);
-  }
-});
-server.listen(8443);
-
+var assign = require('object-assign');
 
 var processes = [];
 processes[_.TYPE_DATA] = processDATA;
@@ -44,8 +15,9 @@ processes[_.TYPE_GOAWAY] = processGOAWAY;
 processes[_.TYPE_WINDOW_UPDATE] = processWINDOW_UPDATE;
 processes[_.TYPE_CONTINUATION] = processCONTINUATION;
 
+var PREFACE = new Buffer('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n');
 
-function createContext() {
+function createContext(handler) {
 
   var latestServerStreamId = 0;
   var initialSettings = [];
@@ -66,45 +38,37 @@ function createContext() {
       context.streams[latestServerStreamId] = true; //TODO
       return latestServerStreamId;
     },
-    tryPushPromise: function(socket, context, streamId, requestHeaders) {
-      var path = requestHeaders.data[':path'];
-      if (path === '/') {
-        var promisedStreamId = context.createNewStream();
-        context.streams[promisedStreamId] = true; //TODO
-        sendPushPromise(socket, context, streamId, requestHeaders, promisedStreamId, '/app.css');
-        sendResponseHTML(socket, context, promisedStreamId, {
-          headerBlockFragment: requestHeaders.headerBlockFragment,
-          data: {
-            ':path': '/app.css'
-          }
-        });
-      }
-
-    }
+    handler: handler
   };
   return context;
 }
 
+//3.5
+function checkConnectionPreface(buf) {
+  for (var i = 0; i < PREFACE.length; i++) {
+    if (buf[i] !== PREFACE[i]) {
+      throw new Error('Received invalid connection preface.');
+    }
+  }
+}
 
-function start(socket) {
-  context = createContext();
-  var preface = new Buffer('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n');
+function start(socket, handler) {
 
   socket.once('readable', function() {
-    var buf = socket.read();
-    for (var i = 0; i < preface.length; i++) {
-      if (buf[i] !== preface[i]) {
-        console.log('Received invalid connection preface.');
-        socket.end(); //TODO send GOAWAY 0x1かも（3.5）
-        return;
-      }
+    try {
+      var buf = socket.read();
+      checkConnectionPreface(buf);
+      console.log('Received valid connection preface.');
+      var context = createContext(handler);
+      mainLoop(socket, context, buf.slice(PREFACE.length));
+    } catch (e) {
+      console.log(e.message);
+      socket.end();
     }
-    console.log('Received valid connection preface.');
-    mainLoop(socket, context, buf.slice(preface.length));
   });
 }
 
-function mainLoop(socket, context, buf) {
+function readFrame(buf) {
   //   0                   1                   2                   3
   //   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
   //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -116,23 +80,37 @@ function mainLoop(socket, context, buf) {
   //  +=+=============================================================+
   //  |                   Frame Payload (0...)                      ...
   //  +---------------------------------------------------------------+
+  var length = buf.readUInt32BE(0) >> 8;
+  if (buf.length < 9 + length) {
+    return null;
+  }
+  var type = buf.readUInt8(3);
+  var flags = buf.readUInt8(4);
+  var streamId = buf.readUInt32BE(5);
+  var payload = buf.slice(9, 9 + length);
+  return {
+    type: type,
+    flags: flags,
+    streamId: streamId,
+    payload: payload
+  };
+}
+
+
+function mainLoop(socket, context, buf) {
+
   var prev = new Buffer(0);
 
   var read = function(socket, context, buf) {
     try {
       buf = Buffer.concat([prev, buf]);
       while (buf.length > 0) {
-        var length = buf.readUInt32BE(0) >> 8;
-        var type = buf.readUInt8(3);
-        var flags = buf.readUInt8(4);
-        var streamId = buf.readUInt32BE(5);
-        if (buf.length >= 9 + length) {
-          var body = buf.slice(9, 9 + length);
-          buf = buf.slice(9 + length);
-          processFrame(socket, context, type, flags, streamId, body);
-        } else {
+        var frame = readFrame(buf);
+        if (!frame) {
           break;
         }
+        buf = buf.slice(9 + frame.payload.length);
+        processFrame(socket, context, frame);
       }
       prev = buf;
     } catch (e) {
@@ -153,7 +131,6 @@ function mainLoop(socket, context, buf) {
     }
     read(socket, context, buf);
   });
-
 }
 
 function error(code, message) {
@@ -162,89 +139,82 @@ function error(code, message) {
 }
 
 
-function processFrame(socket, context, type, flags, streamId, payload) {
-  console.log('[' + streamId + '] ' + _.FRAME_NAME[type]);
+function processFrame(socket, context, frame) {
+  console.log('[' + frame.streamId + '] ' + _.FRAME_NAME[frame.type]);
   //4.2
-  if (payload.length > context.settings[_.SETTINGS_MAX_FRAME_SIZE]) {
+  if (frame.payload.length > context.settings[_.SETTINGS_MAX_FRAME_SIZE]) {
     error(_.ERROR_FRAME_SIZE_ERROR, 'error1');
   }
   //5.1.1
-  if (streamId >= 2 && streamId % 2 === 0 && context.streams[streamId] === undefined) {
+  if (frame.streamId >= 2 && frame.streamId % 2 === 0 && context.streams[frame.streamId] === undefined) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
   //5.1.1
-  if (streamId % 2 === 1) {
-    for (var i = context.streams.length - 1; i > streamId; i--) {
+  if (frame.streamId % 2 === 1) {
+    for (var i = context.streams.length - 1; i > frame.streamId; i--) {
       if (i % 2 === 1 && context.streams[i]) {
         error(_.ERROR_PROTOCOL_ERROR, 'error2');
       }
     }
   }
 
-
   //6.2
   if (context.headerFragment) {
-    if (type !== _.TYPE_CONTINUATION) {
+    if (frame.type !== _.TYPE_CONTINUATION) {
       error(_.ERROR_PROTOCOL_ERROR, 'error3');
     }
-    if (context.headerFragment.streamId !== streamId) {
+    if (context.headerFragment.streamId !== frame.streamId) {
       error(_.ERROR_PROTOCOL_ERROR, 'error4');
     }
   }
 
-  context.streams[streamId] = context.streams[streamId] || 1; //idle?
-
-  //5.1.2
-  var count = 0;
-  for (var i = 0; i < context.streams.length; i++) {
-    if (i % 2 === 1 && context.streams[i]) { //client side
-      count++;
-    }
-  }
-  if (count > context.settings[_.SETTINGS_MAX_CONCURRENT_STREAMS]) {
-    error(_.ERROR_PROTOCOL_ERROR, 'error5');
-  }
-
-  var process = processes[type];
+  var process = processes[frame.type];
   if (process) {
-    process(socket, context, flags, streamId, payload);
+    process(socket, context, frame);
   } else {
     error(_.ERROR_PROTOCOL_ERROR, 'error6'); //TODO
   }
 }
 
-function processDATA(socket, context, flags, streamId, payload) {
-  if (streamId === 0) {
+function processDATA(socket, context, frame) {
+  //6.1
+  if (frame.streamId === 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
-  if (context.streams[streamId] !== 2) {
+  //6.1
+  console.log(context.streams[frame.streamId]);
+  if (context.streams[frame.streamId] !== 'open') {
     error(_.ERROR_STREAM_CLOSED);
+  }
+  var endStream = !!(frame.flags & 0x1);
+  if (context.streams[frame.streamId] === 'open' && endStream) {
+    //recv ES
+    context.streams[frame.streamId] = 'half closed (remote)';
   }
 }
 
-function processHEADERS(socket, context, flags, streamId, payload) {
-  if (streamId === 0) {
+function processHEADERS(socket, context, frame) {
+  if (frame.streamId === 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
   // flags = context.headerFragment ? context.headerFragment.flags : flags;
   // streamId = context.headerFragment ? context.headerFragment.streamId : streamId;
-  payload = context.headerFragment ? Buffer.concat([context.headerFragment.payload, payload]) : payload;
-  var endStream = !!(flags & 0x1);
-  var endHeaders = !!(flags & 0x4);
-  var padded = !!(flags & 0x8);
-  var priority = !!(flags & 0x20);
+  var payload = context.headerFragment ? Buffer.concat([context.headerFragment.payload, frame.payload]) : frame.payload;
+  var endStream = !!(frame.flags & 0x1);
+  var endHeaders = !!(frame.flags & 0x4);
+  var padded = !!(frame.flags & 0x8);
+  var priority = !!(frame.flags & 0x20);
   var headers = readHeaders(context, padded, priority, payload);
 
   if (!endHeaders) {
     context.headerFragment = {
-      flags: flags,
-      streamId: streamId,
+      flags: frame.flags,
+      streamId: frame.streamId,
       payload: payload
     };
     return;
   }
   context.headerFragment = null;
-  context.streams[streamId] = 2; //open
 
   //8.1.2
   var keys = Object.keys(headers.data);
@@ -290,89 +260,114 @@ function processHEADERS(socket, context, flags, streamId, payload) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
 
-  
   console.log('  ' + headers.data[':method'] + ' ' + headers.data[':path']);
-  sendResponseHTML(socket, context, streamId, headers);
+  handleRequest(socket, context, frame.streamId, headers);
+  if (!context.streams[frame.streamId]) { //idle
+    //recv H/
+    if(endHeaders) {
+      //5.1.2 // TODO 多分ここじゃない
+      var count = 0;
+      for (var i = 0; i < context.streams.length; i++) {
+        if (i % 2 === 1 && context.streams[i]) { // open | harf closed | reserved
+          count++;
+        }
+      }
+      if (count + 1 > context.settings[_.SETTINGS_MAX_CONCURRENT_STREAMS]) {
+        error(_.ERROR_PROTOCOL_ERROR, 'error5');
+      }
+      context.streams[frame.streamId] = 'open';
+    }
+  } else if (context.streams[frame.streamId] === 'reserved (remote)') {
+    //recv H
+    context.streams[frame.streamId] = 'half closed (remote)';
+  }
+
+  // TODO: 更新のタイミングどうしよう。
+  if (context.streams[frame.streamId] === 'open') {// 直前にopenになった可能性がある
+    //recv ES
+    if (endStream) {
+      context.streams[frame.streamId] = 'half closed (remote)';
+    }
+  }
 }
 
 
-function processPRIORITY(socket, context, flags, streamId, payload) {
-  if (streamId === 0) {
+function processPRIORITY(socket, context, frame) {
+  if (frame.streamId === 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
-  if (payload.length !== 5) {
+  if (frame.payload.length !== 5) {
     error(_.ERROR_FRAME_SIZE_ERROR);
   }
-  readPriority(flags, payload);
 }
 
-function processSETTINGS(socket, context, flags, streamId, payload) {
-  if (streamId !== 0) {
+function processSETTINGS(socket, context, frame) {
+  if (frame.streamId !== 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
-  var ack = !!(flags & 0x1);
+  var ack = !!(frame.flags & 0x1);
   if (ack) {
-    if (payload.length !== 0) {
+    if (frame.payload.length !== 0) {
       error(_.ERROR_FRAME_SIZE_ERROR);
     }
   } else {
-    if (payload.length % 6 !== 0) {
+    if (frame.payload.length % 6 !== 0) {
       error(_.ERROR_FRAME_SIZE_ERROR);
     }
-    applySettings(context, payload);
+    applySettings(context, frame.payload);
     sendSettings(socket, context.settings);
   }
 }
 
-function processPUSH_PROMISE(socket, context, flags, streamId, payload) {
+function processPUSH_PROMISE(socket, context, frame) {
   error(_.ERROR_PROTOCOL_ERROR);
 }
 
-function processWINDOW_UPDATE(socket, context, flags, streamId, payload) {
-  if (payload.length % 4 !== 0) {
+function processWINDOW_UPDATE(socket, context, frame) {
+  if (frame.payload.length % 4 !== 0) {
     error(_.ERROR_FRAME_SIZE_ERROR);
   }
-  var windowSizeIncrement = payload.readUInt32BE(0);
+  var windowSizeIncrement = frame.payload.readUInt32BE(0);
   if (windowSizeIncrement === 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
   console.log('  ' + windowSizeIncrement);
 }
 
-function processCONTINUATION(socket, context, flags, streamId, payload) {
-  if(!context.headerFragment) {
+function processCONTINUATION(socket, context, frame) {
+  if (!context.headerFragment) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
-  processHEADERS(socket, context, flags, streamId, payload);
+  processHEADERS(socket, context, frame);
 }
 
-function processRST_STREAM(socket, context, flags, streamId, payload) {
-  if (streamId === 0) {
+function processRST_STREAM(socket, context, frame) {
+  if (frame.streamId === 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
-  if (context.streams[streamId] === 1) { //idle
+  if (!context.streams[frame.streamId]) { //idle
     error(_.ERROR_PROTOCOL_ERROR);
   }
-  if (payload.length !== 4) {
+  if (frame.payload.length !== 4) {
     error(_.ERROR_FRAME_SIZE_ERROR);
   }
 }
 
-function processPING(socket, context, flags, streamId, payload) {
-  if (streamId !== 0) {
+function processPING(socket, context, frame) {
+  if (frame.streamId !== 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
-  if (payload.length !== 8) {
+  if (frame.payload.length !== 8) {
     error(_.ERROR_FRAME_SIZE_ERROR);
   }
-  var ack = !!(flags & 0x1);
+  var ack = !!(frame.flags & 0x1);
   if (!ack) {
-    sendPing(socket, streamId, payload);
+    sendPing(socket, frame.streamId, frame.payload);
   }
 }
 
-function processGOAWAY(socket, context, flags, streamId, payload) {
-  if (streamId !== 0) {
+function processGOAWAY(socket, context, frame) {
+  if (frame.streamId !== 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
 }
@@ -382,15 +377,15 @@ function applySettings(context, payload) {
     var identifier = payload.readUInt16BE(i);
     var value = payload.readUInt32BE(i + 2);
     //6.5.2
-    if(identifier == _.SETTINGS_ENABLE_PUSH && value !== 0 && value !== 1) {
+    if (identifier == _.SETTINGS_ENABLE_PUSH && value !== 0 && value !== 1) {
       error(_.ERROR_PROTOCOL_ERROR);
     }
     //6.5.2
-    if(identifier == _.SETTINGS_INITIAL_WINDOW_SIZE) {
+    if (identifier == _.SETTINGS_INITIAL_WINDOW_SIZE) {
       //TODO
     }
     //6.5.2
-    if(identifier == _.SETTINGS_MAX_FRAME_SIZE) {
+    if (identifier == _.SETTINGS_MAX_FRAME_SIZE) {
       //TODO
     }
     context.settings[identifier] = value;
@@ -429,11 +424,6 @@ function readHeaders(context, padded, priority, payload) {
   return headers;
 }
 
-function readPriority(flags, payload) {
-
-}
-
-
 function sendSettings(socket, settings) {
   // FRAME 1 -----------//
   var settingCount = 4; //TODO
@@ -449,7 +439,6 @@ function sendSettings(socket, settings) {
     buffer.writeUInt16BE(number, 9 + i * 6);
     buffer.writeUInt32BE(settings[number], 9 + i * 6 + 2);
   }
-  assert.equal(9 + payloadLength, buffer.length);
 
   send(socket, buffer);
 
@@ -461,53 +450,55 @@ function sendSettings(socket, settings) {
   send(socket, buffer);
 }
 
-function sendResponseHTML(socket, context, streamId, requestHeaders) {
+function handleRequest(socket, context, streamId, requestHeaders) {
 
-  context.tryPushPromise && context.tryPushPromise(socket, context, streamId, requestHeaders);
-
-  var path = requestHeaders.data[':path'];
-  if (path === '/') {
-    path = 'index.html';
-  } else {
-    path = path.substring(1);
-  }
+  var req = {
+    method: requestHeaders.data[':method'],
+    url: requestHeaders.data[':path']
+  };
 
   var headers = [];
-  headers[0] = [':status', '200'];
-  if (path.indexOf('.html') >= 0) {
-    headers[1] = ['content-type', 'text/html'];
-  } else {
-    headers[1] = [':path', '/app.css'];
-    headers[2] = ['content-type', 'text/css'];
+  var res = {
+    pushPromise: function(path) {
+      sendPushPromise(socket, context, streamId, requestHeaders, path);
+    },
+    writeHead: function(status, _headers) {
+      headers[0] = [':status', '' + status];
+      Object.keys(_headers).forEach(function(key, i) { //TODO :pathは必要？
+        headers[i + 1] = [key, _headers[key]];
+      });
+    },
+    end: function(data) {
+      var flags = 0x4; // end_headers
+      // header
+      var compressed = context.compressor.compress(headers);
+      var payloadLength = compressed.length;
+      var header = new Buffer(9);
+
+      writeHeader(header, payloadLength, _.TYPE_HEADERS, flags, streamId);
+
+      var buffer = Buffer.concat([header, compressed]);
+      send(socket, buffer);
+
+      // BODY -------------//
+      var data = new Buffer(data ? data : 0);
+      var payloadLength = data.length;
+      var header = new Buffer(9);
+      var flags = 0x1; // end_stream
+      // header
+      writeHeader(header, payloadLength, _.TYPE_DATA, flags, streamId);
+
+      var buffer = Buffer.concat([header, data]);
+      send(socket, buffer);
+    }
   }
-  var compressed = context.compressor.compress(headers);
-
-  var payloadLength = compressed.length;
-  var header = new Buffer(9);
-
-  var flags = 0x4; // end_headers
-  // header
-  writeHeader(header, payloadLength, _.TYPE_HEADERS, flags, streamId);
-
-  var buffer = Buffer.concat([header, compressed]);
-  send(socket, buffer);
-
-  // BODY -------------//
-  var data = new Buffer(fs.readFileSync(path));
-
-  var payloadLength = data.length
-  var header = new Buffer(9);
-
-  var flags = 0x1; // end_stream
-  // header
-  writeHeader(header, payloadLength, _.TYPE_DATA, flags, streamId);
-
-  var buffer = Buffer.concat([header, data]);
-  send(socket, buffer);
+  context.handler && context.handler(req, res);
 }
 
 
-function sendPushPromise(socket, context, streamId, requestHeaders, promisedStreamId, relatedPath) {
+function sendPushPromise(socket, context, streamId, requestHeaders, relatedPath) {
+  var promisedStreamId = context.createNewStream();
+
   var headers = [];
   requestHeaders.headerBlockFragment.forEach(function(header) {
     if (header[0] === ':path') {
@@ -525,7 +516,16 @@ function sendPushPromise(socket, context, streamId, requestHeaders, promisedStre
 
   buffer.writeUInt32BE(promisedStreamId, 9);
   compressedResponseHeader.copy(buffer, 9 + 4);
+
+  context.streams[promisedStreamId] = 'reserved (local)';
   send(socket, buffer, promisedStreamId);
+
+  handleRequest(socket, context, promisedStreamId, {
+    headerBlockFragment: requestHeaders.headerBlockFragment,
+    data: {
+      ':path': relatedPath
+    }
+  });
 }
 
 function sendPing(socket, streamId, payload) {
@@ -535,7 +535,7 @@ function sendPing(socket, streamId, payload) {
 
   var buffer = new Buffer(9 + payloadLength);
   writeHeader(buffer, payloadLength, _.TYPE_PING, flags, streamId);
-  payload.copy(buffer, 9);
+  payload.copy(buffer, 9); //TODO ?
 
   send(socket, buffer);
 }
@@ -568,3 +568,37 @@ function send(socket, buffer, info) {
   console.log('  => [' + buffer.readUInt32BE(5) + '] ' + typeName + (info ? ': ' + info : ''));
   socket.write(buffer);
 }
+
+function createServer(options, handler) {
+  options = assign({
+    requestCert: true,
+    rejectUnauthorized: false,
+    NPNProtocols: ['h2-14', 'h2-16', 'http/1.1', 'http/1.0'], //unofficial
+  }, options);
+
+  var server = tls.createServer(options)
+  server.on('secureConnection', function(socket) {
+    socket.on('close', function(isException) {
+      console.log('<<end>>');
+    });
+    socket.on('error', function(err) {
+      console.log(err.stack);
+    });
+    if (socket.npnProtocol === 'h2-14' || socket.npnProtocol === 'h2-16') {
+      console.log();
+      console.log('<<start>> protocol: ' + socket.npnProtocol);
+      start(socket, handler);
+    } else {
+      throw new Error('socket.npnProtocol:' + socket.npnProtocol);
+    }
+  });
+  return {
+    listen: function(port) {
+      server.listen(port);
+    }
+  };
+}
+
+module.exports = {
+  createServer: createServer
+};
