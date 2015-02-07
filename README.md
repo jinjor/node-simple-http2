@@ -3,7 +3,7 @@ node-simple-http2
 
 Simple implementation of HTTP/2 server by Node.js
 
-- only sending 'Hello, World!'
+- logging frame info for learning HTTP/2
 - working with some browsers
 - readable for beginner (no streams & no objects)
 
@@ -12,14 +12,23 @@ Simple implementation of HTTP/2 server by Node.js
 $ git clone --recursive https://github.com/jinjor/node-simple-http2.git
 ```
 
-### Start
+### Sample
 ```
-$ cd node-simple-http2
-$ node index
+$ cd node-simple-http2/sample
+$ node server
 ```
-PEM pass is `http2`.
 
 ### Browse
+
+#### Chrome
+(2015/02/07)
+
+1. open Chrome
+2. visit `chrome://flags/#enable-spdy4`
+3. enable SPDY4 and restart Chrome
+4. visit `https://localhost:8443`
+
+#### Firefox Nightly
 (2014/12/25)
 
 1. open [Firefox Nightly](https://nightly.mozilla.org/)
