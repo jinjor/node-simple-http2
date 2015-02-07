@@ -3,8 +3,8 @@ var fs = require('fs');
 var Path = require('path');
 
 var options = {
-  key: fs.readFileSync('ssl/server.key'),
-  cert: fs.readFileSync('ssl/server.crt'),
+  key: fs.readFileSync('ssl/key.pem'),
+  cert: fs.readFileSync('ssl/cert.pem')
 };
 
 http2.createServer(options, function(req, res) {

@@ -589,6 +589,7 @@ function createServer(options, handler) {
       console.log('<<start>> protocol: ' + socket.npnProtocol);
       start(socket, handler);
     } else {
+      // socket.end();
       throw new Error('socket.npnProtocol:' + socket.npnProtocol);
     }
   });
