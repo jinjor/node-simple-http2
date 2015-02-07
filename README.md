@@ -22,6 +22,7 @@ $ node server
 
 #### Chrome
 (2015/02/07)
+
 1. open Chrome
 2. visit `chrome://flags/#enable-spdy4`
 3. enable SPDY4 and restart Chrome
@@ -29,6 +30,7 @@ $ node server
 
 #### Firefox Nightly
 (2014/12/25)
+
 1. open [Firefox Nightly](https://nightly.mozilla.org/)
 2. visit `about:config`
 3. set `network.http.spdy.enabled.http2draft` to `true`
