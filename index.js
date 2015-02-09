@@ -1,5 +1,6 @@
 var tls = require('tls');
 var hpack = require('./sasazka/lib/hpack.js');
+var hpack2 = require('./hpack.js');
 var _ = require('./constants.js');
 var assign = require('object-assign');
 
@@ -32,6 +33,7 @@ function createContext(handler) {
     settings: initialSettings,
     compressor: hpack.createContext(),
     decompressor: hpack.createContext(),
+    hpack2: hpack2(),
     streams: [true],
     createNewStream: function() {
       latestServerStreamId = latestServerStreamId + 2;
@@ -416,6 +418,9 @@ function readHeaders(context, padded, priority, payload) {
   }
   var headerBlockFragment = payload.slice(offset); //assume padding does not exist
   var decompressed = context.decompressor.decompress(headerBlockFragment);
+  // context.hpack2.decode(headerBlockFragment);
+  // console.log(decompressed);
+
   headers.headerBlockFragment = decompressed;
 
   headers.data = {};
