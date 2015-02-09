@@ -418,8 +418,8 @@ function readHeaders(context, padded, priority, payload) {
   }
   var headerBlockFragment = payload.slice(offset); //assume padding does not exist
   var decompressed = context.decompressor.decompress(headerBlockFragment);
-  // context.hpack2.decode(headerBlockFragment);
-  // console.log(decompressed);
+  context.hpack2.decode(headerBlockFragment);
+  console.log(decompressed);
 
   headers.headerBlockFragment = decompressed;
 
