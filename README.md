@@ -9,7 +9,7 @@ Simple implementation of HTTP/2 server by Node.js
 
 ### Clone
 ```
-$ git clone --recursive https://github.com/jinjor/node-simple-http2.git
+$ git clone https://github.com/jinjor/node-simple-http2.git
 ```
 
 ### Sample

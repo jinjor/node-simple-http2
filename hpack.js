@@ -64,14 +64,43 @@ var STATIC_TABLE = [
   ['via', ''],
   ['www-authenticate', '']
 ];
-var staticTableMap = {};
-STATIC_TABLE.forEach(function(pair, index) {
-  staticTableMap[pair[0]] = staticTableMap[pair[0]] || {
-    index: index,
-    values: {}
-  };
-  staticTableMap[pair[0]].values[pair[1]] = true;
-});
+
+function findIndex(context, name, value) {
+  var index = null;
+  var valueFound = false;
+  for (var i = 0; i < STATIC_TABLE.length; i++) {
+    if (name === STATIC_TABLE[i][0]) {
+      index = index || i;
+      if (STATIC_TABLE[i][1] === value) {
+        index = i;
+        valueFound = true;
+        break;
+      }
+    }
+    if (index && name !== STATIC_TABLE[i][0]) {
+      break;
+    }
+  }
+  if (valueFound) {
+    return [index, valueFound];
+  }
+
+  for (var i = 0; i < context.dynamicTable.length; i++) {
+    if (name === context.dynamicTable[i][0]) {
+      index = index || i + STATIC_TABLE.length;
+      if (context.dynamicTable[i][1] === value) {
+        index = i + STATIC_TABLE.length;
+        valueFound = true;
+        break;
+      }
+    }
+    if (index && name !== context.dynamicTable[i][0]) {
+      break;
+    }
+  }
+
+  return [index, valueFound];
+}
 
 
 
@@ -142,14 +171,11 @@ function encode(context, header, useHuffman) {
   var bufs = header.map(function(pair) {
     var name = pair[0];
     var value = pair[1];
-    var index = null;
-    var indexedValue = false;
-    if (staticTableMap[name]) {
-      index = staticTableMap[name].index;
-      if (staticTableMap[name].values[value]) {
-        indexedValue = true;
-      }
-    }
+
+    var tmp = findIndex(context, name, value);
+    var index = tmp[0];
+    var indexedValue = tmp[1];
+
     var header = 0;
     if (index && indexedValue) {
       var indexBuffer = encodeNumber(index, 7);
@@ -161,6 +187,8 @@ function encode(context, header, useHuffman) {
       var encodedString = huffman.encode(value);
       var length = encodeNumber(encodedString.length, 7);
       length[0] |= 0x80; //H
+
+      updateDynamicTable(context, name, value);
       return Buffer.concat([indexBuffer, length, encodedString]);
     } else {
       var indexBuffer = new Buffer(1);
@@ -171,6 +199,8 @@ function encode(context, header, useHuffman) {
       var encodedValue = huffman.encode(value);
       var valueLength = encodeNumber(encodedValue.length, 7);
       valueLength[0] |= 0x80; //H
+
+      updateDynamicTable(context, name, value);
       return Buffer.concat([indexBuffer, nameLength, encodedName, valueLength, encodedValue]);
     }
   });
@@ -188,8 +218,6 @@ function decode(context, buf, result) {
     if (index === 0) {
       throw 'error';
     }
-    console.log('(_)', type, index, getByIndex(context, index));
-
     result.push(getByIndex(context, index));
     buf = buf.slice(num[1]);
   } else if (!(header & 0x80) && !(header & 0x40) && !!(header & 0x20)) { //動的テーブルサイズ更新
@@ -243,9 +271,6 @@ function decode(context, buf, result) {
       if (type === 'A') {
         updateDynamicTable(context, name, value);
       }
-
-      console.log('(a)', type, index, getByIndex(context, index), valueLength, huffmaned, value);
-
       result.push([name, value]);
 
       buf = buf.slice(valueLength);
@@ -284,9 +309,6 @@ function decode(context, buf, result) {
       if (type === 'A') {
         updateDynamicTable(context, name, value);
       }
-
-      console.log('(b)', type, nameHuffmaned, name, valueHuffmaned, value);
-
       result.push([name, value]);
 
       buf = buf.slice(valueLength);
@@ -298,7 +320,8 @@ function decode(context, buf, result) {
 module.exports = function(maxTableSize) {
   var context = {
     dynamicTable: [],
-    maxTableSize: maxTableSize
+    maxTableSize: maxTableSize,
+
   };
   return {
     encode: function(header) {
@@ -312,7 +335,6 @@ module.exports = function(maxTableSize) {
         }
         return result;
       } catch (e) {
-
         console.log(e.trace);
       }
     }

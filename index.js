@@ -1,6 +1,5 @@
 var tls = require('tls');
-var hpack = require('./sasazka/lib/hpack.js');
-var hpack2 = require('./hpack.js');
+var hpack = require('./hpack.js');
 var _ = require('./constants.js');
 var assign = require('object-assign');
 
@@ -31,9 +30,8 @@ function createContext(handler) {
 
   var context = {
     settings: initialSettings,
-    decompressor: hpack.createContext(),
-    compressor: hpack.createContext(),
-    hpack: hpack2(initialSettings[_.SETTINGS_HEADER_TABLE_SIZE]),
+    encoder: hpack(initialSettings[_.SETTINGS_HEADER_TABLE_SIZE]),
+    decoder: hpack(initialSettings[_.SETTINGS_HEADER_TABLE_SIZE]),
     streams: [true],
     createNewStream: function() {
       latestServerStreamId = latestServerStreamId + 2;
@@ -418,8 +416,7 @@ function readHeaders(context, padded, priority, payload) {
   }
   var headerBlockFragment = payload.slice(offset); //assume padding does not exist
 
-  var decompressed = context.decompressor.decompress(headerBlockFragment);
-  // var decompressed = context.hpack.decode(headerBlockFragment);
+  var decompressed = context.decoder.decode(headerBlockFragment);
 
   headers.headerBlockFragment = decompressed;
 
@@ -477,11 +474,7 @@ function handleRequest(socket, context, streamId, requestHeaders) {
     end: function(data) {
       var flags = 0x4; // end_headers
       // header
-      var compressed = context.compressor.compress(headers);
-      // var compressed2 = context.hpack.encode(headers);
-      // console.log(compressed);
-      // console.log(compressed2);
-
+      var compressed = context.encoder.encode(headers);
       var payloadLength = compressed.length;
       var header = new Buffer(9);
 
@@ -517,7 +510,7 @@ function sendPushPromise(socket, context, streamId, requestHeaders, relatedPath)
       headers.push(header);
     }
   });
-  var compressedResponseHeader = context.compressor.compress(headers);
+  var compressedResponseHeader = context.encoder.encode(headers);
 
   var payloadLength = compressedResponseHeader.length + 4;
   var buffer = new Buffer(9 + payloadLength);
