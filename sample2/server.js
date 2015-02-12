@@ -1,9 +1,13 @@
 var fs = require('fs');
 var express = require('express');
+var compress = require('compression');
 var autopp = require('./index.js');
 
 ///
 var app = express();
+app.use(compress({
+  threshold : 0
+}));
 app.use(express.static(__dirname + '/public'));
 app.listen(3000);
 ///

@@ -31,9 +31,9 @@ function createContext(handler) {
 
   var context = {
     settings: initialSettings,
-    compressor: hpack.createContext(),
     decompressor: hpack.createContext(),
-    hpack2: hpack2(),
+    compressor: hpack.createContext(),
+    hpack: hpack2(initialSettings[_.SETTINGS_HEADER_TABLE_SIZE]),
     streams: [true],
     createNewStream: function() {
       latestServerStreamId = latestServerStreamId + 2;
@@ -267,7 +267,7 @@ function processHEADERS(socket, context, frame) {
   handleRequest(socket, context, frame.streamId, headers);
   if (!context.streams[frame.streamId]) { //idle
     //recv H/
-    if(endHeaders) {
+    if (endHeaders) {
       //5.1.2 // TODO 多分ここじゃない
       var count = 0;
       for (var i = 0; i < context.streams.length; i++) {
@@ -286,7 +286,7 @@ function processHEADERS(socket, context, frame) {
   }
 
   // TODO: 更新のタイミングどうしよう。
-  if (context.streams[frame.streamId] === 'open') {// 直前にopenになった可能性がある
+  if (context.streams[frame.streamId] === 'open') { // 直前にopenになった可能性がある
     //recv ES
     if (endStream) {
       context.streams[frame.streamId] = 'half closed (remote)';
@@ -417,9 +417,9 @@ function readHeaders(context, padded, priority, payload) {
     headers.weight = weight;
   }
   var headerBlockFragment = payload.slice(offset); //assume padding does not exist
+
   var decompressed = context.decompressor.decompress(headerBlockFragment);
-  // context.hpack2.decode(headerBlockFragment);
-  // console.log(decompressed);
+  // var decompressed = context.hpack.decode(headerBlockFragment);
 
   headers.headerBlockFragment = decompressed;
 
@@ -478,6 +478,10 @@ function handleRequest(socket, context, streamId, requestHeaders) {
       var flags = 0x4; // end_headers
       // header
       var compressed = context.compressor.compress(headers);
+      // var compressed2 = context.hpack.encode(headers);
+      // console.log(compressed);
+      // console.log(compressed2);
+
       var payloadLength = compressed.length;
       var header = new Buffer(9);
 

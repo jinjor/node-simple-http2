@@ -3,6 +3,7 @@ var Path = require('path');
 var htmlparser2 = require('htmlparser2');
 var request = require('request');
 
+
 var parse = function(html, onScript, onStyle) {
   var parser = new htmlparser2.Parser({
     onopentag: function(name, attribs) {

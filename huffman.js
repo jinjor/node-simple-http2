@@ -294,6 +294,47 @@ function decode(buffer) {
   return s;
 }
 
+function encode(s) { //TODO ライブラリ無いかなー
+  var result = [];
+  var data = 0;
+  var remains = 8;
+  var shift;
+
+  for (var i = 0, len = s.length; i < len; i++) {
+    var code = table[s.charCodeAt(i)][0];
+    var bit = table[s.charCodeAt(i)][1];
+
+    while (bit > 0) {
+      if (remains > bit) {
+        shift = remains - bit;
+        data += code << shift;
+        remains -= bit;
+        bit = 0;
+      } else {
+        shift = bit - remains;
+        data += code >> shift;
+        bit -= remains;
+        remains -= remains;
+      }
+
+      if (remains === 0) {
+        result.push(data);
+        data = 0;
+        remains = 8;
+      }
+    }
+  }
+
+  if (remains < 8) {
+    shift = (table[256][1] - remains);
+    data += table[256][0] >> shift;
+    result.push(data);
+  }
+
+  return new Buffer(result);
+};
+
 module.exports = {
-  decode: decode
+  decode: decode,
+  encode: encode
 };

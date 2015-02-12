@@ -1,17 +1,5 @@
 var huffman = require('./huffman');
 
-// <----------  Index Address Space ---------->
-// <-- Static  Table -->  <-- Dynamic Table -->
-// +---+-----------+---+  +---+-----------+---+
-// | 1 |    ...    | s |  |s+1|    ...    |s+k|
-// +---+-----------+---+  +---+-----------+---+
-//                        ^                   |
-//                        |                   V
-//                 Insertion Point      Dropping Point
-
-
-// SETTINGS_HEADER_TABLE_SIZEで動的テーブルのサイズが決まる
-
 var STATIC_TABLE = [
   [],
   [':authority', ''],
@@ -76,6 +64,15 @@ var STATIC_TABLE = [
   ['via', ''],
   ['www-authenticate', '']
 ];
+var staticTableMap = {};
+STATIC_TABLE.forEach(function(pair, index) {
+  staticTableMap[pair[0]] = staticTableMap[pair[0]] || {
+    index: index,
+    values: {}
+  };
+  staticTableMap[pair[0]].values[pair[1]] = true;
+});
+
 
 
 function decodeNumber(octets, n) {
@@ -91,22 +88,96 @@ function decodeNumber(octets, n) {
         break;
       }
     }
-    console.log(i+1);
+    console.log(i + 1);
     return [sum, i + 1];
   } else {
     return [octets[0] % x, 1];
   }
 }
 
-function decodeString(context, buf) {
-
-  console.log(buf[0]);
-
-
+function encodeNumber(number, n) {
+  var limit = Math.pow(2, n) - 1;
+  if (number > limit) {
+    number = number - limit;
+    var octets = [limit];
+    while (true) {
+      var r = number % 128;
+      var q = (number - r) / 128;
+      if (q > 0) {
+        octets.push(r + 128);
+        number = q;
+      } else {
+        octets.push(r);
+        break;
+      }
+    }
+    return new Buffer(octets);
+  } else {
+    return new Buffer([number]);
+  }
 }
 
 
-function decode(context, buf) {
+function getByIndex(context, index) {
+  if (index === 0) {
+    throw 'error';
+  }
+  if (index >= STATIC_TABLE.length) {
+    return context.dynamicTable[index - STATIC_TABLE.length];
+  } else {
+    return STATIC_TABLE[index];
+  }
+}
+
+function updateDynamicTable(context, name, value) {
+  context.dynamicTable.unshift([name, value]);
+  fixTableSize(context);
+}
+
+function fixTableSize(context) {
+  context.dynamicTable.length = Math.min(context.dynamicTable.length, context.maxTableSize);
+}
+
+function encode(context, header, useHuffman) {
+  var bufs = header.map(function(pair) {
+    var name = pair[0];
+    var value = pair[1];
+    var index = null;
+    var indexedValue = false;
+    if (staticTableMap[name]) {
+      index = staticTableMap[name].index;
+      if (staticTableMap[name].values[value]) {
+        indexedValue = true;
+      }
+    }
+    var header = 0;
+    if (index && indexedValue) {
+      var indexBuffer = encodeNumber(index, 7);
+      indexBuffer[0] |= 0x80;
+      return indexBuffer;
+    } else if (index) {
+      var indexBuffer = encodeNumber(index, 6);
+      indexBuffer[0] |= 0x40;
+      var encodedString = huffman.encode(value);
+      var length = encodeNumber(encodedString.length, 7);
+      length[0] |= 0x80; //H
+      return Buffer.concat([indexBuffer, length, encodedString]);
+    } else {
+      var indexBuffer = new Buffer(1);
+      indexBuffer[0] |= 0x40;
+      var encodedName = huffman.encode(name);
+      var nameLength = encodeNumber(encodedName.length, 7);
+      nameLength[0] |= 0x80; //H
+      var encodedValue = huffman.encode(value);
+      var valueLength = encodeNumber(encodedValue.length, 7);
+      valueLength[0] |= 0x80; //H
+      return Buffer.concat([indexBuffer, nameLength, encodedName, valueLength, encodedValue]);
+    }
+  });
+  return Buffer.concat(bufs);
+}
+
+function decode(context, buf, result) {
   var header = buf[0];
   var length = null;
   if (!!(header & 0x80)) { //インデックスヘッダフィールド表現
@@ -117,11 +188,14 @@ function decode(context, buf) {
     if (index === 0) {
       throw 'error';
     }
-    console.log('(_)', type, index, STATIC_TABLE[index]);
+    console.log('(_)', type, index, getByIndex(context, index));
+
+    result.push(getByIndex(context, index));
     buf = buf.slice(num[1]);
   } else if (!(header & 0x80) && !(header & 0x40) && !!(header & 0x20)) { //動的テーブルサイズ更新
     var num = decodeNumber(buf, 5);
-    var maxSize = num[0];
+    context.maxTableSize = num[0];
+    fixTableSize(context);
     buf = buf.slice(num[1]);
   } else {
     var indexDecodeN = 0;
@@ -152,7 +226,7 @@ function decode(context, buf) {
       var headerLength = num[1];
       buf = buf.slice(headerLength);
 
-      var huffmaned = !!(buf[0] && 0x80);
+      var huffmaned = !!(buf[0] & 0x80);
       num = decodeNumber(buf, 7);
       var valueLengthLength = num[1];
       var valueLength = num[0];
@@ -165,13 +239,20 @@ function decode(context, buf) {
       } else {
         value = value.toString();
       }
-      console.log('(a)', type, index, STATIC_TABLE[index], valueLength, huffmaned, value);
+      var name = getByIndex(context, index)[0]
+      if (type === 'A') {
+        updateDynamicTable(context, name, value);
+      }
+
+      console.log('(a)', type, index, getByIndex(context, index), valueLength, huffmaned, value);
+
+      result.push([name, value]);
 
       buf = buf.slice(valueLength);
     } else {
       buf = buf.slice(1);
 
-      var nameHuffmaned = !!(buf[0] && 0x80);
+      var nameHuffmaned = !!(buf[0] & 0x80);
       var num = decodeNumber(buf, 7);
       var nameLengthLength = num[1];
       var nameLength = num[0];
@@ -187,7 +268,7 @@ function decode(context, buf) {
 
       buf = buf.slice(nameLength);
 
-      var valueHuffmaned = !!(buf[0] && 0x80);
+      var valueHuffmaned = !!(buf[0] & 0x80);
       var num = decodeNumber(buf, 7);
       var valueLengthLength = num[1];
       var valueLength = num[0];
@@ -200,8 +281,13 @@ function decode(context, buf) {
       } else {
         value = value.toString();
       }
+      if (type === 'A') {
+        updateDynamicTable(context, name, value);
+      }
 
       console.log('(b)', type, nameHuffmaned, name, valueHuffmaned, value);
+
+      result.push([name, value]);
 
       buf = buf.slice(valueLength);
     }
@@ -209,29 +295,26 @@ function decode(context, buf) {
   return buf;
 }
 
-
-function updateIndex(context, buf) {
-
-
-}
-
-
-
-module.exports = function() {
-  var context = {};
+module.exports = function(maxTableSize) {
+  var context = {
+    dynamicTable: [],
+    maxTableSize: maxTableSize
+  };
   return {
-    encode: function(buf) {
-      decode(context, buf);
+    encode: function(header) {
+      return encode(context, header, true); //TODO
     },
     decode: function(buf) {
       try {
+        var result = [];
         while (buf.length) {
-          buf = decode(context, buf);
+          buf = decode(context, buf, result);
         }
+        return result;
       } catch (e) {
-        console.log(e);
-      }
 
+        console.log(e.trace);
+      }
     }
   };
 };
