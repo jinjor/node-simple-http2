@@ -111,13 +111,12 @@ function decodeNumber(octets, n) {
     for (var i = 1; i < octets.length; i++) {
       var octet = octets[i];
       if (!!(octet & 0x80)) {
-        sum += (octet % x) + Math.pow(128, i - 1);
+        sum += (octet - 128) * Math.pow(128, i - 1);
       } else {
-        sum += octet + Math.pow(128, i - 1);
+        sum += octet * Math.pow(128, i - 1);
         break;
       }
     }
-    console.log(i + 1);
     return [sum, i + 1];
   } else {
     return [octets[0] % x, 1];
@@ -149,7 +148,11 @@ function encodeNumber(number, n) {
 
 function getByIndex(context, index) {
   if (index === 0) {
-    throw 'error';
+    throw new Error('error2');
+  }
+
+  if (index >= STATIC_TABLE.length + context.dynamicTable.length) {
+    throw new Error('error3: ' + index);
   }
   if (index >= STATIC_TABLE.length) {
     return context.dynamicTable[index - STATIC_TABLE.length];
@@ -214,10 +217,6 @@ function decode(context, buf, result) {
     var type = ' ';
     var num = decodeNumber(buf, 7);
     index = num[0];
-    //6.1
-    if (index === 0) {
-      throw 'error';
-    }
     result.push(getByIndex(context, index));
     buf = buf.slice(num[1]);
   } else if (!(header & 0x80) && !(header & 0x40) && !!(header & 0x20)) { //動的テーブルサイズ更新
@@ -244,7 +243,6 @@ function decode(context, buf, result) {
         indexDecodeN = 4;
       }
     }
-
     if (indexDecodeN) {
       var num = decodeNumber(buf, indexDecodeN);
       var index = num[0];
@@ -288,7 +286,7 @@ function decode(context, buf, result) {
       if (nameHuffmaned) {
         name = huffman.decode(name);
       } else {
-        name = value.toString();
+        name = name.toString();
       }
 
       buf = buf.slice(nameLength);
@@ -321,22 +319,19 @@ module.exports = function(maxTableSize) {
   var context = {
     dynamicTable: [],
     maxTableSize: maxTableSize,
-
   };
   return {
     encode: function(header) {
       return encode(context, header, true); //TODO
     },
     decode: function(buf) {
-      try {
-        var result = [];
-        while (buf.length) {
-          buf = decode(context, buf, result);
-        }
-        return result;
-      } catch (e) {
-        console.log(e.trace);
+      var result = [];
+      while (buf.length) {
+        buf = decode(context, buf, result);
       }
+
+      // console.log(result);
+      return result;
     }
   };
 };
