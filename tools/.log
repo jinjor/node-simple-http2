@@ -1,0 +1,9 @@
+5.1. Stream States
+  5.1.1. Stream Identifiers
+    [31m× Sends even-numbered stream identifier[0m
+    [31m  - The endpoint MUST respond with a connection error of type PROTOCOL_ERROR.[0m
+    [31m× Sends stream identifier that is numerically smaller than previous[0m
+    [31m  - The endpoint MUST respond with a connection error of type PROTOCOL_ERROR.[0m
+  5.1.2. Stream Concurrency
+    [32m✓[0m [90mSends HEADERS frames that causes their advertised concurrent stream limit to be exceeded[0m
+

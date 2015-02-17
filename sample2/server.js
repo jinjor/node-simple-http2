@@ -5,16 +5,16 @@ var autopp = require('./index.js');
 
 ///
 var app = express();
-app.use(compress({
-  threshold : 0
-}));
+// app.use(compress({
+//   threshold : 0
+// }));
 app.use(express.static(__dirname + '/public'));
 app.listen(3000);
 ///
 
-var options = {
+var tlsOptions = {
   key: fs.readFileSync('ssl/key.pem'),
   cert: fs.readFileSync('ssl/cert.pem')
 };
 
-autopp(options, 8443, 3000);
+autopp(tlsOptions, 8443, 3000);

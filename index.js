@@ -2,6 +2,7 @@ var tls = require('tls');
 var hpack = require('./hpack.js');
 var _ = require('./constants.js');
 var assign = require('object-assign');
+var EventEmitter = require('events').EventEmitter;
 
 var processes = [];
 processes[_.TYPE_DATA] = processDATA;
@@ -32,20 +33,31 @@ function createContext(handler) {
   var remoteSettings = initialSettings.concat(); //copy
 
   var context = {
+    latestServerStreamId: 0,
     localSettings: localSettings,
     remoteSettings: remoteSettings,
     encoder: hpack(localSettings[_.SETTINGS_HEADER_TABLE_SIZE]),
     decoder: hpack(localSettings[_.SETTINGS_HEADER_TABLE_SIZE]),
-    streams: ['open'],
-    streamData: [],
-    createNewStream: function() {
-      latestServerStreamId = latestServerStreamId + 2;
-      context.streams[latestServerStreamId] = 'idle';
-      return latestServerStreamId;
-    },
+    streams: [{
+      state: 'open'
+    }],
     handler: handler
   };
   return context;
+}
+
+function createNewStream(context) {
+  context.latestServerStreamId = context.latestServerStreamId + 2;
+  context.streams[context.latestServerStreamId] = {
+    state: 'idle'
+  };
+  // 5.1.1
+  for (var i = 0; i < context.latestServerStreamId; i += 2) {
+    if (context.streams[i].state === 'idle') {
+      context.streams[i].state = 'closed';
+    }
+  }
+  return context.latestServerStreamId;
 }
 
 
@@ -121,12 +133,16 @@ function mainLoop(socket, context, buf) {
       }
       prev = buf;
     } catch (e) {
-      var code = +e.message;
-      if (isNaN(code)) {
-        console.log(e.stack);
-        code = _.ERROR_INTERNAL_ERROR;
+      if (!e.code) {
+        console.log('error: ' + e.message);
+        e.code = _.ERROR_INTERNAL_ERROR;
       }
-      sendGoAway(socket, context, code);
+      if (e.streamId) {
+        sendRstStream(socket, context, e.streamId, e.code);
+      } else {
+        sendGoAway(socket, context, e.code);
+      }
+
     }
   }
   read(socket, context, buf);
@@ -140,34 +156,59 @@ function mainLoop(socket, context, buf) {
   });
 }
 
-function error(code, message) {
+function error(code, streamId, message) {
   message && console.log('  ERR: ' + message);
-  throw new Error(code);
+  var error = {
+    code: code,
+    streamId: streamId
+  };
+  throw error;
 }
 
 
 function processFrame(socket, context, frame) {
 
   console.log('[' + frame.streamId + '] ' + _.FRAME_NAME[frame.type]);
+
+  //5.1.1
+  if (frame.streamId >= 2 && frame.streamId % 2 === 0) {
+    error(_.ERROR_PROTOCOL_ERROR);
+  }
+  //5.1.1
+  if (frame.streamId % 2 === 1 && !context.streams[frame.streamId]) {
+    for (var i = context.streams.length - 1; i > frame.streamId; i--) {
+      if (i % 2 === 1 && context.streams[i]) {
+        console.log(context.streams[1], context.streams[3], context.streams[5]);
+        console.log(context.streams.length, frame.streamId);
+        error(_.ERROR_PROTOCOL_ERROR);
+      }
+    }
+  }
+
+  context.streams[frame.streamId] = context.streams[frame.streamId] || {
+    state: 'idle'
+  };
+
+
   //6.2
   if (context.headerFragment) {
     if (frame.type !== _.TYPE_CONTINUATION) {
-      error(_.ERROR_PROTOCOL_ERROR, 'error3');
+      error(_.ERROR_PROTOCOL_ERROR);
     }
     if (context.headerFragment.streamId !== frame.streamId) {
-      error(_.ERROR_PROTOCOL_ERROR, 'error4');
+      error(_.ERROR_PROTOCOL_ERROR);
     }
   }
   //TODO ↑と↓が順序に依存している…
   //6.1
-  var state = context.streams[frame.streamId];
+  var state = context.streams[frame.streamId].state;
   if (frame.type === _.TYPE_DATA && state !== 'open' && state !== 'half-closed-local') {
-    error(_.ERROR_STREAM_CLOSED, 'stream [' + frame.streamId + '] is ' + state);
+    error(_.ERROR_STREAM_CLOSED, null, 'stream [' + frame.streamId + '] is ' + state);
   }
 
   //4.2
   if (frame.payload.length > context.localSettings[_.SETTINGS_MAX_FRAME_SIZE]) {
-    error(_.ERROR_FRAME_SIZE_ERROR, 'error1');
+    error(_.ERROR_FRAME_SIZE_ERROR);
   }
 
   updateStream(context, frame);
@@ -176,7 +217,7 @@ function processFrame(socket, context, frame) {
   if (process) {
     process(socket, context, frame);
   } else {
-    error(_.ERROR_PROTOCOL_ERROR, 'error6'); //TODO
+    error(_.ERROR_PROTOCOL_ERROR); //TODO
   }
 }
 
@@ -194,12 +235,11 @@ function processDATA(socket, context, frame) {
   } else {
     data = frame.payload;
   }
-  var headers = context.streamData[frame.streamId].headers;
+  var headers = context.streams[frame.streamId].headers;
   var endStream = !!(frame.flags & 0x1);
-  context.streamData[frame.streamId].data = Buffer.concat([context.streamData[frame.streamId].data, data]);
-  if (endStream) {
-    handleRequest(socket, context, frame.streamId, headers, context.streamData[frame.streamId].data);
-  }
+  context.streams[frame.streamId].dataSize =
+    (context.streams[frame.streamId].dataSize || 0) + data.length; // 
+  context.streams[frame.streamId].request.emit('data', data);
 }
 
 function processHEADERS(socket, context, frame) {
@@ -250,7 +290,6 @@ function processHEADERS(socket, context, frame) {
     var key = keys[i];
     if (key[0] === ':') {
       if (key !== ':method' && key !== ':scheme' && key !== ':authority' && key !== ':path') {
-        console.log('error2');
         error(_.ERROR_PROTOCOL_ERROR);
       }
     }
@@ -276,19 +315,12 @@ function processHEADERS(socket, context, frame) {
   }
   //8.1.2.6
   if (headers.data['content-length'] && +headers.data['content-length'] !== headerBlockFragment.length) {
-    error(_.ERROR_PROTOCOL_ERROR);
+    error(_.ERROR_PROTOCOL_ERROR, frame.streamId);
   }
 
   console.log('  ' + headers.data[':method'] + ' ' + headers.data[':path']);
 
-  context.streamData[frame.streamId] = {
-    headers: headers,
-    data: new Buffer(0)
-  };
-  if (endStream) {
-    // console.log('endStream' + frame.flags);
-    handleRequest(socket, context, frame.streamId, headers);
-  }
+  handleRequest(socket, context, frame.streamId, headers);
 }
 
 
@@ -297,7 +329,7 @@ function processPRIORITY(socket, context, frame) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
   if (frame.payload.length !== 5) {
-    error(_.ERROR_FRAME_SIZE_ERROR);
+    error(_.ERROR_FRAME_SIZE_ERROR, frame.streamId);
   }
 }
 
@@ -329,7 +361,7 @@ function processWINDOW_UPDATE(socket, context, frame) {
   }
   var windowSizeIncrement = frame.payload.readUInt32BE(0);
   if (windowSizeIncrement === 0) {
-    error(_.ERROR_PROTOCOL_ERROR);
+    error(_.ERROR_PROTOCOL_ERROR, frame.streamId);
   }
   console.log('  ' + windowSizeIncrement);
 }
@@ -345,7 +377,7 @@ function processRST_STREAM(socket, context, frame) {
   if (frame.streamId === 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
-  if (!context.streams[frame.streamId]) { //idle
+  if (!context.streams[frame.streamId] || context.streams[frame.streamId].state === 'idle') {
     error(_.ERROR_PROTOCOL_ERROR);
   }
   if (frame.payload.length !== 4) {
@@ -438,10 +470,10 @@ function sendSettings(socket, context) {
 
 function handleRequest(socket, context, streamId, requestHeaders) {
 
-  var req = {
-    method: requestHeaders.data[':method'],
-    url: requestHeaders.data[':path']
-  };
+  var req = new EventEmitter();
+  req.method = requestHeaders.data[':method'];
+  req.url = requestHeaders.data[':path'];
+  req.headers = requestHeaders.data;
 
   var headers = [];
   var res = {
@@ -470,15 +502,14 @@ function handleRequest(socket, context, streamId, requestHeaders) {
       var header = writeHeader(payloadLength, _.TYPE_DATA, flags, streamId);
       var all = Buffer.concat([header, payload]);
       send(socket, context, all);
-
     }
   }
+  context.streams[streamId].request = req;
   context.handler && context.handler(req, res);
 }
 
-
 function sendPushPromise(socket, context, streamId, requestHeaders, relatedPath) {
-  var promisedStreamId = context.createNewStream();
+  var promisedStreamId = createNewStream(context);
 
   var headers = [];
   requestHeaders.headerBlockFragment.forEach(function(header) {
@@ -514,6 +545,22 @@ function sendPing(socket, context, streamId, payload) {
   var header = writeHeader(payloadLength, _.TYPE_PING, flags, streamId);
   var all = Buffer.concat([header, payload]);
   send(socket, context, all);
+}
+
+function sendRstStream(socket, context, streamId, errorCode) {
+  var payloadLength = 4;
+  var flags = 0x0;
+
+  var header = writeHeader(payloadLength, _.TYPE_RST_STREAM, flags, streamId);
+  var payload = new Buffer(payloadLength);
+  payload.writeUInt32BE(errorCode, 0);
+  var all = Buffer.concat([header, payload]);
+  try {
+    send(socket, context, all, _.ERROR_NAME[errorCode]);
+  } catch (e) {
+    console.log('aaa: ' + e);
+  }
+
 }
 
 function sendGoAway(socket, context, errorCode) {
@@ -552,57 +599,59 @@ function isEndStream(frame) {
   return (frame.type === _.TYPE_HEADERS || frame.type === _.TYPE_DATA) && !!(frame.flags & 0x1);
 }
 
-function isActiveStream(state) {
-  return state && (state === 'open' || state.indexOf('half-closed') === 0);
+function isActiveStream(stream) {
+  return stream && (stream.state === 'open' || stream.state.indexOf('half-closed') === 0);
 }
 
 function updateStream(context, frame, send) {
-  var state = context.streams[frame.streamId];
+  if (frame.type === _.TYPE_CONTINUATION) {
+    return;
+  }
+
+  var state = context.streams[frame.streamId].state;
   var endStream = isEndStream(frame);
-  //5.1.1
-  if (frame.streamId >= 2 && frame.streamId % 2 === 0 && context.streams[frame.streamId] === undefined) {
-    error(_.ERROR_PROTOCOL_ERROR);
+
+  //5.1
+  if (!send && state === 'half-closed-remote' &&
+    (frame.type !== _.WINDOW_UPDATE && frame.type !== _.TYPE_PRIORITY && frame.type !== _.RST_STREAM)) {
+    error(_.ERROR_STREAM_CLOSED, frame.streamId);
   }
-  //5.1.1
-  if (frame.streamId % 2 === 1) {
-    for (var i = context.streams.length - 1; i > frame.streamId; i--) {
-      if (i % 2 === 1 && context.streams[i]) {
-        error(_.ERROR_PROTOCOL_ERROR, 'error2');
-      }
-    }
+  if (!send && state === 'closed' && frame.type !== _.TYPE_PRIORITY) {
+    error(_.ERROR_STREAM_CLOSED, frame.streamId);
   }
+
 
   if (!state || state === 'idle') {
     if (frame.type === _.TYPE_HEADERS) {
-      context.streams[frame.streamId] = 'open';
+      context.streams[frame.streamId].state = 'open';
     } else if (send && frame.type === _.TYPE_PUSH_PROMISE) {
-      context.streams[frame.streamId] = 'reserved-local';
+      context.streams[frame.streamId].state = 'reserved-local';
     } else if (!send && frame.type === _.TYPE_PUSH_PROMISE) {
-      context.streams[frame.streamId] = 'reserved-remote';
+      context.streams[frame.streamId].state = 'reserved-remote';
     }
   } else if (state === 'reserved-local') {
     if (frame.type === _.TYPE_RST_STREAM) {
-      context.streams[frame.streamId] = 'closed';
+      context.streams[frame.streamId].state = 'closed';
     } else if (send && frame.type === _.TYPE_HEADERS) {
-      context.streams[frame.streamId] = 'half-closed-remote';
+      context.streams[frame.streamId].state = 'half-closed-remote';
     }
   } else if (state === 'reserved-remote') {
     if (frame.type === _.TYPE_RST_STREAM) {
-      context.streams[frame.streamId] = 'closed';
+      context.streams[frame.streamId].state = 'closed';
     } else if (!send && frame.type === _.TYPE_HEADERS) {
-      context.streams[frame.streamId] = 'half-closed-local';
+      context.streams[frame.streamId].state = 'half-closed-local';
     }
   } else if (state === 'open') {
     if (frame.type === _.TYPE_RST_STREAM) {
-      context.streams[frame.streamId] = 'closed';
+      context.streams[frame.streamId].state = 'closed';
     }
   } else if (state === 'half-closed-remote') {
     if (frame.type === _.TYPE_RST_STREAM) {
-      context.streams[frame.streamId] = 'closed';
+      context.streams[frame.streamId].state = 'closed';
     }
   } else if (state === 'half-closed-local') {
     if (frame.type === _.TYPE_RST_STREAM) {
-      context.streams[frame.streamId] = 'closed';
+      context.streams[frame.streamId].state = 'closed';
     }
   }
 
@@ -615,28 +664,26 @@ function updateStream(context, frame, send) {
     }
     if (count > context.localSettings[_.SETTINGS_MAX_CONCURRENT_STREAMS]) {
       // console.log(count, context.localSettings[_.SETTINGS_MAX_CONCURRENT_STREAMS]);
-      error(_.ERROR_PROTOCOL_ERROR, 'error5');
+      error(_.ERROR_PROTOCOL_ERROR, frame.streamId);
     }
   }
 
-  state = context.streams[frame.streamId];
+  state = context.streams[frame.streamId].state;
 
   // endStream
   if (state === 'open') {
     if (!send && endStream) {
-      context.streams[frame.streamId] = 'half-closed-remote';
+      context.streams[frame.streamId].state = 'half-closed-remote';
     } else if (send && endStream) {
-      console.log(123)
-      context.streams[frame.streamId] = 'half-closed-local';
+      context.streams[frame.streamId].state = 'half-closed-local';
     }
   } else if (state === 'half-closed-remote') {
     if (send && endStream) {
-      context.streams[frame.streamId] = 'closed';
+      context.streams[frame.streamId].state = 'closed';
     }
   } else if (state === 'half-closed-local') {
     if (!send && endStream) {
-      console.log(456)
-      context.streams[frame.streamId] = 'closed';
+      context.streams[frame.streamId].state = 'closed';
     }
   }
 
