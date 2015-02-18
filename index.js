@@ -420,6 +420,8 @@ function processGOAWAY(socket, context, frame) {
   if (frame.streamId !== 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
+  var errorCode = frame.payload.readUInt32BE(4);
+  console.log('  ' + _.ERROR_NAME[errorCode]);
   // socket.end();
 }
 
@@ -464,7 +466,7 @@ function readHeaderBlockFragment(padded, priority, payload) {
     headers.streamDependency = streamDependency;
     headers.weight = weight;
   }
-  return payload.slice(offset); //assume padding does not exist
+  return payload.slice(offset, offset + payload.length - padLength);
 }
 
 function sendSettings(socket, context) {
