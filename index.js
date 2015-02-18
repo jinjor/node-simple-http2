@@ -75,6 +75,9 @@ function start(socket, handler) {
   socket.once('readable', function() {
     try {
       var buf = socket.read();
+      if (!buf) {
+        return;
+      }
       checkConnectionPreface(buf);
       console.log('Received valid connection preface.');
       var context = createContext(handler);
@@ -171,8 +174,8 @@ function processFrame(socket, context, frame) {
   console.log('[' + frame.streamId + '] ' + _.FRAME_NAME[frame.type]);
 
   //5.1.1
-  if (frame.streamId >= 2 && frame.streamId % 2 === 0) {
-    error(_.ERROR_PROTOCOL_ERROR);
+  if (frame.streamId >= 2 && frame.streamId % 2 === 0 && !context.streams[frame.streamId]) {
+    error(_.ERROR_PROTOCOL_ERROR, null, '8xqnzc');
   }
   //5.1.1
   if (frame.streamId % 2 === 1 && !context.streams[frame.streamId]) {
@@ -359,7 +362,7 @@ function processWINDOW_UPDATE(socket, context, frame) {
   if (frame.payload.length % 4 !== 0) {
     error(_.ERROR_FRAME_SIZE_ERROR);
   }
-  var windowSizeIncrement = frame.payload.readUInt32BE(0);
+  var windowSizeIncrement = frame.payload.readUInt32BE(0) % 2147483647;
   if (windowSizeIncrement === 0) {
     error(_.ERROR_PROTOCOL_ERROR, frame.streamId);
   }
@@ -402,6 +405,7 @@ function processGOAWAY(socket, context, frame) {
   if (frame.streamId !== 0) {
     error(_.ERROR_PROTOCOL_ERROR);
   }
+  // socket.end();
 }
 
 function applySettings(context, payload) {
@@ -417,7 +421,7 @@ function applySettings(context, payload) {
       error(_.ERROR_FLOW_CONTROL_ERROR);
     }
     //6.5.2
-    if (identifier == _.SETTINGS_MAX_FRAME_SIZE && (value < 65535 || value > 16777215)) {
+    if (identifier == _.SETTINGS_MAX_FRAME_SIZE && (value < 16384 || value > 16777215)) {
       error(_.ERROR_PROTOCOL_ERROR);
     }
     context.remoteSettings[identifier] = value;
@@ -613,7 +617,7 @@ function updateStream(context, frame, send) {
 
   //5.1
   if (!send && state === 'half-closed-remote' &&
-    (frame.type !== _.WINDOW_UPDATE && frame.type !== _.TYPE_PRIORITY && frame.type !== _.RST_STREAM)) {
+    (frame.type !== _.TYPE_WINDOW_UPDATE && frame.type !== _.TYPE_PRIORITY && frame.type !== _.TYPE_RST_STREAM)) {
     error(_.ERROR_STREAM_CLOSED, frame.streamId);
   }
   if (!send && state === 'closed' && frame.type !== _.TYPE_PRIORITY) {

@@ -68,7 +68,9 @@ module.exports = function(tlsOptions, fromPort, toPort) {
         res.writeHead(response.statusCode, {
           'content-type': response.headers['content-type'].split(';')[0]
         });
-        res.end(new Buffer(body));
+        var buf = new Buffer(body)
+        console.log(buf.length);
+        res.end(buf);
       }
     });
   }).listen(fromPort);
