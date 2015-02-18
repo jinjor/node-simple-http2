@@ -401,6 +401,8 @@ function processRST_STREAM(socket, context, frame) {
   if (frame.payload.length !== 4) {
     error(_.ERROR_FRAME_SIZE_ERROR);
   }
+  var errorCode = frame.payload.readUInt32BE(0);
+  console.log('  ' + _.ERROR_NAME[errorCode]);
 }
 
 function processPING(socket, context, frame) {
@@ -553,7 +555,7 @@ function sendPushPromise(socket, context, streamId, requestHeaders, relatedPath)
   payload.writeUInt32BE(promisedStreamId, 0);
   compressedResponseHeader.copy(payload, 4);
   var all = Buffer.concat([header, payload]);
-  send(socket, context, all, promisedStreamId);
+  send(socket, context, all, promisedStreamId + ' ' + relatedPath);
 
   handleRequest(socket, context, promisedStreamId, {
     headerBlockFragment: requestHeaders.headerBlockFragment,
