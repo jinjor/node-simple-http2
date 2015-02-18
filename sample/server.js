@@ -27,17 +27,20 @@ http2.createServer(options, function(req, res) {
   } else if (path.indexOf('.css') >= 0) {
     contentType = 'text/css';
   }
-  var status = 200;
-  var data = null;
+
   var filePath = Path.join('public', path);
   if (fs.existsSync(filePath)) {
-    data = fs.readFileSync(filePath);
+    fs.readFile(filePath, function(e, data) {
+      res.writeHead(200, {
+        'content-type': contentType
+      });
+      res.end(data);
+    });
   } else {
-    status = 404;
+    res.writeHead(404, {
+      'content-type': contentType
+    });
+    res.end();
   }
-  res.writeHead(status, {
-    'content-type': contentType
-  });
-  res.end(data);
   
 }).listen(8443);

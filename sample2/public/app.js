@@ -4,7 +4,7 @@ setTimeout(function() {
 		return resource.name + ': ' + resource.duration + '<br>';
 	}).join('');
 	document.body.innerHTML = html;
-}, 100);
+}, 500);
 
 
 

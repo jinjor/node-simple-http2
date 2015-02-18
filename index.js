@@ -151,6 +151,10 @@ function mainLoop(socket, context, buf) {
   read(socket, context, buf);
 
   socket.on('readable', function() { // assume synchronized & sequencial
+    if(socket._closed) {
+      console.log('read canceled');
+      return;
+    }
     var buf = socket.read();
     if (!buf) {
       return;
@@ -509,7 +513,10 @@ function handleRequest(socket, context, streamId, requestHeaders) {
     }
   }
   context.streams[streamId].request = req;
-  context.handler && context.handler(req, res);
+  // setImmediate(function(){
+    context.handler && context.handler(req, res);
+  // });
+  
 }
 
 function sendPushPromise(socket, context, streamId, requestHeaders, relatedPath) {
@@ -578,7 +585,9 @@ function sendGoAway(socket, context, errorCode) {
   payload.writeUInt32BE(errorCode, 4);
   var all = Buffer.concat([header, payload]);
   send(socket, context, all, _.ERROR_NAME[errorCode]);
+  socket._closed = true;
   socket.end();
+  
 }
 
 function writeHeader(length, type, flags, streamId) {
@@ -591,10 +600,15 @@ function writeHeader(length, type, flags, streamId) {
 }
 
 function send(socket, context, buffer, info) {
+  
   var frame = readFrame(buffer);
   var typeName = _.FRAME_NAME[frame.type];
 
   updateStream(context, frame, true);
+  if(socket._closed) {
+    console.log('  (ignored) => [' + buffer.readUInt32BE(5) + '] ' + typeName + (info ? ': ' + info : ''));
+    return;
+  }
   console.log('  => [' + buffer.readUInt32BE(5) + '] ' + typeName + (info ? ': ' + info : ''));
   socket.write(buffer);
 }
@@ -618,10 +632,10 @@ function updateStream(context, frame, send) {
   //5.1
   if (!send && state === 'half-closed-remote' &&
     (frame.type !== _.TYPE_WINDOW_UPDATE && frame.type !== _.TYPE_PRIORITY && frame.type !== _.TYPE_RST_STREAM)) {
-    error(_.ERROR_STREAM_CLOSED, frame.streamId);
+    error(_.ERROR_STREAM_CLOSED, frame.streamId, 'f35obl');
   }
   if (!send && state === 'closed' && frame.type !== _.TYPE_PRIORITY) {
-    error(_.ERROR_STREAM_CLOSED, frame.streamId);
+    error(_.ERROR_STREAM_CLOSED, frame.streamId, '58ad98');
   }
 
 
@@ -659,6 +673,7 @@ function updateStream(context, frame, send) {
     }
   }
 
+  // 5.1.2
   if (!send && isActiveStream(context.streams[frame.streamId])) {
     var count = 0;
     for (var i = 0; i < context.streams.length; i++) {
@@ -666,9 +681,12 @@ function updateStream(context, frame, send) {
         count++;
       }
     }
+    // console.log(count, context.localSettings[_.SETTINGS_MAX_CONCURRENT_STREAMS]);
     if (count > context.localSettings[_.SETTINGS_MAX_CONCURRENT_STREAMS]) {
       // console.log(count, context.localSettings[_.SETTINGS_MAX_CONCURRENT_STREAMS]);
-      error(_.ERROR_PROTOCOL_ERROR, frame.streamId);
+      // error(_.ERROR_PROTOCOL_ERROR, frame.streamId);
+      error(_.ERROR_REFUSED_STREAM, frame.streamId);
+
     }
   }
 
@@ -706,6 +724,7 @@ function createServer(options, handler) {
   var server = tls.createServer(options)
   server.on('secureConnection', function(socket) {
     socket.on('close', function(isException) {
+      socket._closed = true;
       console.log('<<end>>');
     });
     socket.on('error', function(err) {
