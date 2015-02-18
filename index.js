@@ -53,6 +53,11 @@ function createNewStream(context) {
   };
   // 5.1.1
   for (var i = 0; i < context.latestServerStreamId; i += 2) {
+    if (!context.streams[i]) {
+      context.streams[i] = {
+        state: 'idle'
+      };
+    }
     if (context.streams[i].state === 'idle') {
       context.streams[i].state = 'closed';
     }
@@ -151,7 +156,7 @@ function mainLoop(socket, context, buf) {
   read(socket, context, buf);
 
   socket.on('readable', function() { // assume synchronized & sequencial
-    if(socket._closed) {
+    if (socket._closed) {
       console.log('read canceled');
       return;
     }
@@ -192,6 +197,8 @@ function processFrame(socket, context, frame) {
     }
   }
 
+
+
   context.streams[frame.streamId] = context.streams[frame.streamId] || {
     state: 'idle'
   };
@@ -216,6 +223,11 @@ function processFrame(socket, context, frame) {
   //4.2
   if (frame.payload.length > context.localSettings[_.SETTINGS_MAX_FRAME_SIZE]) {
     error(_.ERROR_FRAME_SIZE_ERROR);
+  }
+
+  // 8.2
+  if(frame.type === _.TYPE_PUSH_PROMISE) {
+    error(_.ERROR_PROTOCOL_ERROR);
   }
 
   updateStream(context, frame);
@@ -359,7 +371,6 @@ function processSETTINGS(socket, context, frame) {
 }
 
 function processPUSH_PROMISE(socket, context, frame) {
-  error(_.ERROR_PROTOCOL_ERROR);
 }
 
 function processWINDOW_UPDATE(socket, context, frame) {
@@ -514,9 +525,9 @@ function handleRequest(socket, context, streamId, requestHeaders) {
   }
   context.streams[streamId].request = req;
   // setImmediate(function(){
-    context.handler && context.handler(req, res);
+  context.handler && context.handler(req, res);
   // });
-  
+
 }
 
 function sendPushPromise(socket, context, streamId, requestHeaders, relatedPath) {
@@ -587,7 +598,7 @@ function sendGoAway(socket, context, errorCode) {
   send(socket, context, all, _.ERROR_NAME[errorCode]);
   socket._closed = true;
   socket.end();
-  
+
 }
 
 function writeHeader(length, type, flags, streamId) {
@@ -600,12 +611,12 @@ function writeHeader(length, type, flags, streamId) {
 }
 
 function send(socket, context, buffer, info) {
-  
+
   var frame = readFrame(buffer);
   var typeName = _.FRAME_NAME[frame.type];
 
   updateStream(context, frame, true);
-  if(socket._closed) {
+  if (socket._closed) {
     console.log('  (ignored) => [' + buffer.readUInt32BE(5) + '] ' + typeName + (info ? ': ' + info : ''));
     return;
   }
@@ -639,13 +650,17 @@ function updateStream(context, frame, send) {
   }
 
 
-  if (!state || state === 'idle') {
+  if (frame.type === _.TYPE_PUSH_PROMISE) {
+    var padded = !!(frame.flags & 0x8);
+    var reservedStreamId = padded ? frame.payload.readUInt32BE(1) : frame.payload.readUInt32BE(0);
+    if (send) {
+      context.streams[reservedStreamId].state = 'reserved-local';
+    } else {
+      context.streams[reservedStreamId].state = 'reserved-remote';
+    }
+  } else if (!state || state === 'idle') {
     if (frame.type === _.TYPE_HEADERS) {
       context.streams[frame.streamId].state = 'open';
-    } else if (send && frame.type === _.TYPE_PUSH_PROMISE) {
-      context.streams[frame.streamId].state = 'reserved-local';
-    } else if (!send && frame.type === _.TYPE_PUSH_PROMISE) {
-      context.streams[frame.streamId].state = 'reserved-remote';
     }
   } else if (state === 'reserved-local') {
     if (frame.type === _.TYPE_RST_STREAM) {
